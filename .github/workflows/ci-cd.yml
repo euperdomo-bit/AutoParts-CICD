@@ -1,0 +1,175 @@
+name: CI-CD AutoParts
+
+# ─────────────────────────────────────────────────────────────
+# CUÁNDO se ejecuta el pipeline
+#   - En cada push a develop
+#   - En cada pull request hacia main
+# ─────────────────────────────────────────────────────────────
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [main]
+
+# Permisos mínimos que necesita el token automático de GitHub
+permissions:
+  contents: read
+  security-events: write   # para subir resultados de CodeQL (Advanced Security)
+
+env:
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/autoparts
+
+jobs:
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 1: Construir imagen, probar DENTRO del contenedor y escanear con Docker Scout
+  # ═══════════════════════════════════════════════════════════
+  build-test-scout:
+    name: Build + Tests + Docker Scout
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar el código
+        uses: actions/checkout@v4
+
+      - name: Preparar Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login en Docker Hub (Docker Scout lo necesita)
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Construir imagen (sin publicar todavía)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true            # deja la imagen en el Docker local del runner
+          push: false
+          tags: autoparts:ci
+
+      # settings.py exige variables como SECRET_KEY. El .env real NO va en la imagen,
+      # así que le pasamos la plantilla con valores falsos (.env.example)
+      - name: Ejecutar pruebas unitarias dentro del contenedor
+        run: docker run --rm --env-file .env.example autoparts:ci python manage.py test -v 2
+
+      - name: Docker Scout - buscar CVEs críticas en la imagen
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: local://autoparts:ci
+          only-severities: critical
+          exit-code: true       # si encuentra críticas => el job FALLA
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 2: SonarCloud (calidad + análisis estático) - solo en PR a main
+  # ═══════════════════════════════════════════════════════════
+  sonarcloud:
+    name: SonarCloud
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # historial completo: Sonar lo usa para saber qué código es nuevo
+
+      - name: Análisis SonarCloud
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          # Espera el resultado del Quality Gate; si falla => el job FALLA
+          args: >
+            -Dsonar.qualitygate.wait=true
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 3: Snyk (dependencias + código) - solo en PR a main
+  # ═══════════════════════════════════════════════════════════
+  snyk:
+    name: Snyk
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Instalar dependencias (Snyk las necesita para armar el árbol)
+        run: pip install -r requirements.txt
+
+      - name: Instalar Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Snyk Open Source - vulnerabilidades en dependencias
+        run: snyk test --file=requirements.txt --package-manager=pip --command=python --severity-threshold=critical
+
+      - name: Snyk Code - análisis estático (SAST) del código
+        run: snyk code test --severity-threshold=high
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 4: GitHub Advanced Security - dependencias + secretos + CodeQL
+  # ═══════════════════════════════════════════════════════════
+  github-advanced-security:
+    name: GitHub Advanced Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # trufflehog revisa el historial de commits
+
+      - name: Dependency Review - bloquea dependencias vulnerables nuevas
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+
+      - name: Escaneo de secretos en los commits
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --results=verified,unknown
+
+      - name: CodeQL - inicializar
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: CodeQL - analizar
+        uses: github/codeql-action/analyze@v3
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 5: Publicar en Docker Hub
+  #   Solo corre si TODOS los jobs anteriores pasaron (o se saltaron
+  #   porque no aplicaban, ej. Sonar/Snyk en un push a develop).
+  #   Si cualquiera falla => NO se publica (despliegue interrumpido).
+  # ═══════════════════════════════════════════════════════════
+  publish:
+    name: Publicar imagen en Docker Hub
+    needs: [build-test-scout, sonarcloud, snyk, github-advanced-security]
+    if: >
+      always() &&
+      needs.build-test-scout.result == 'success' &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Construir y publicar
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest

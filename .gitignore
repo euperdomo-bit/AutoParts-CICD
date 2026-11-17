@@ -1,0 +1,14 @@
+# Secretos: NUNCA al repositorio (las claves reales viven solo en tu PC)
+.env
+
+# Entorno virtual de Python (cada uno lo crea en su PC con pip install)
+venv/
+.venv/
+
+# Archivos generados por Python
+__pycache__/
+*.pyc
+
+# Configuración personal del editor
+.vscode/
+.idea/

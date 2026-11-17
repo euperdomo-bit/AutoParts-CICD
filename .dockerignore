@@ -1,0 +1,15 @@
+# Nunca meter secretos en la imagen (las variables se pasan al ejecutar con --env-file o -e)
+.env
+# Cosas que no sirven dentro de la imagen
+.git
+.github
+**/__pycache__
+**/*.pyc
+.venv
+venv
+env
+*.log
+.vscode
+.idea
+# Archivo SQLite suelto/duplicado que no usa la app (la BD real es backend/db.sqlite3)
+backend/backend
