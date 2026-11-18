@@ -104,13 +104,15 @@ jobs:
           python-version: '3.13'
 
       - name: Instalar dependencias (Snyk las necesita para armar el árbol)
-        run: pip install -r requirements.txt
+        run: |
+          pip install "setuptools<81"
+          pip install -r requirements.txt
 
       - name: Instalar Snyk CLI
         uses: snyk/actions/setup@master
 
       - name: Snyk Open Source - vulnerabilidades en dependencias
-        run: snyk test --file=requirements.txt --package-manager=pip --command=python --severity-threshold=critical
+        run: snyk test --file=requirements.txt --package-manager=pip --command=python --severity-threshold=critical -d
 
       - name: Snyk Code - análisis estático (SAST) del código
         run: snyk code test --severity-threshold=high
